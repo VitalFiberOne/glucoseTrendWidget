@@ -1,0 +1,564 @@
+// Begin custom widget code
+// DO NOT REMOVE OR MODIFY THE CODE ABOVE!
+
+import 'dart:ui' as ui;
+
+// SELF-CONTAINED LIVE SUPABASE VERSION (ASCII ONLY)
+// - CustomPainter rendering (no fl_chart, no intl)
+// - Uses Supabase client exposed by FlutterFlow auto-imports
+// - Seeds mock data so it always renders, then replaces with live rows
+// - Lightweight polling every 30s for near-live updates
+
+class GlucoseTrendWidget extends StatefulWidget {
+  const GlucoseTrendWidget({super.key, this.width, this.height});
+  final double? width;
+  final double? height;
+
+  @override
+  State<GlucoseTrendWidget> createState() => _GlucoseTrendWidgetState();
+}
+
+class _GlucoseTrendWidgetState extends State<GlucoseTrendWidget> {
+  // Last 24h window
+  final Duration _lookback = const Duration(hours: 24);
+
+  // Data points (UTC, mg/dL)
+  final List<_Point> _points = <_Point>[];
+
+  double _low = 70;
+  double _high = 180;
+
+  double _minY = 60;
+  double _maxY = 240;
+
+  late DateTime _nowUtc;
+  late DateTime _fromUtc;
+
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _nowUtc = DateTime.now().toUtc();
+    _fromUtc = _nowUtc.subtract(_lookback);
+
+    _seedMock();
+    _recalcBounds();
+
+    _wireLiveSupabase();
+  }
+
+  void _seedMock() {
+    _points.clear();
+    final int totalMins = 24 * 60;
+    for (int m = 0; m <= totalMins; m += 5) {
+      final DateTime t = _fromUtc.add(Duration(minutes: m));
+      final double base = 110 + 30 * _quickSin(m / 180.0) + 10 * _quickSin(m / 37.0);
+      final double val = base.clamp(55, 260).toDouble();
+      _points.add(_Point(t, val));
+    }
+  }
+
+  // Cheap sine approximation
+  double _quickSin(double x) {
+    const double pi = 3.1415926535;
+    x %= (2 * pi);
+    final double numer = 16 * x * (pi - x);
+    final double denom = 5 * pi * pi - 4 * x * (pi - x);
+    return numer / denom;
+  }
+
+  void _recalcBounds() {
+    if (_points.isEmpty) {
+      _minY = (_low - 15).clamp(40, 120).toDouble();
+      _maxY = (_high + 20).clamp(180, 400).toDouble();
+      return;
+    }
+    double lo = _points.first.y;
+    double hi = _points.first.y;
+    for (final _Point p in _points) {
+      if (p.y < lo) lo = p.y;
+      if (p.y > hi) hi = p.y;
+    }
+    _minY = (lo - 10).clamp(40, 120).toDouble();
+    _maxY = (hi + 10).clamp(180, 400).toDouble();
+    if (_low - 15 < _minY) _minY = (_low - 15).clamp(40, 120).toDouble();
+    if (_high + 20 > _maxY) _maxY = (_high + 20).clamp(180, 400).toDouble();
+  }
+
+  // Live: Supabase fetch + polling
+  void _wireLiveSupabase() async {
+    try {
+      final client = Supabase.instance.client; // provided by FF auto-imports
+      final user = client.auth.currentUser;
+      if (user == null) return; // stay on mock if not logged in
+
+      await _fetchAndApply(client, user.id);
+      _pollLoop(client, user.id);
+    } catch (e) {
+      setState(() => _error = e.toString());
+    }
+  }
+
+  Future<void> _fetchAndApply(dynamic client, String uid) async {
+    _nowUtc = DateTime.now().toUtc();
+    _fromUtc = _nowUtc.subtract(_lookback);
+
+    final String fromIso = _fromUtc.toIso8601String();
+    final dynamic res = await client
+        .from('bloodglucoselog')
+        .select('created_at, glucose_level, lowThreshold, highThreshold')
+        .eq('user_id', uid)
+        .gte('created_at', fromIso)
+        .order('created_at', ascending: true);
+
+    final List<dynamic> rows = (res as List<dynamic>);
+    if (rows.isEmpty) return; // keep mock
+
+    final List<_Point> next = <_Point>[];
+    double? lowT;
+    double? highT;
+
+    for (final dynamic row in rows) {
+      final num? gnum = row['glucose_level'] as num?;
+      final String? created = row['created_at'] as String?;
+      if (gnum == null || created == null) continue;
+      final DateTime ts = DateTime.parse(created).toUtc();
+      if (ts.isBefore(_fromUtc)) continue;
+      next.add(_Point(ts, gnum.toDouble()));
+      final num? l = row['lowThreshold'] as num?;
+      final num? h = row['highThreshold'] as num?;
+      if (l != null) lowT = l.toDouble();
+      if (h != null) highT = h.toDouble();
+    }
+
+    if (next.isEmpty) return;
+
+    setState(() {
+      _points
+        ..clear()
+        ..addAll(next);
+      if (lowT != null) _low = lowT!;
+      if (highT != null) _high = highT!;
+      _recalcBounds();
+      _error = null;
+    });
+  }
+
+  void _pollLoop(dynamic client, String uid) async {
+    while (mounted) {
+      try {
+        await _fetchAndApply(client, uid);
+      } catch (_) {
+        // ignore and keep last good view
+      }
+      await Future<void>.delayed(const Duration(seconds: 30));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final double width = widget.width ?? double.infinity;
+    final double height = widget.height ?? 320;
+
+    final _Point? latest = _points.isNotEmpty ? _points.last : null;
+    final _Point? prev = _points.length > 1 ? _points[_points.length - 2] : null;
+    final double trend = (latest != null && prev != null) ? (latest.y - prev.y) : 0.0;
+
+    String status = '-';
+    if (latest != null) {
+      status = (latest.y < _low)
+          ? 'LOW'
+          : (latest.y > _high)
+              ? 'HIGH'
+              : 'IN RANGE';
+    }
+
+    Color statusColor = const Color(0xFF9E9E9E);
+    if (latest != null) {
+      statusColor = status == 'IN RANGE'
+          ? const Color(0xFF009688)
+          : (status == 'LOW')
+              ? const Color(0xFFFF9800)
+              : const Color(0xFFE91E63);
+    }
+
+    final Widget errorWidget = (_error == null)
+        ? const SizedBox.shrink()
+        : Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text('Live data error: ' + _error!,
+                style: const TextStyle(fontSize: 11, color: Color(0xFFB00020))),
+          );
+
+    return SizedBox(
+      width: width,
+      height: height,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: const Color(0x99FFFFFF),
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(color: const Color(0x1F000000)),
+          boxShadow: const [BoxShadow(color: Color(0x14000000), blurRadius: 18, offset: Offset(0, 10))],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              // Header
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: <Widget>[
+                  Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+                    const Text('Live Glucose', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 4),
+                    Row(children: <Widget>[
+                      Text(
+                        latest == null ? '- mg/dL' : '${latest.y.toStringAsFixed(0)} mg/dL',
+                        style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w800),
+                      ),
+                      const SizedBox(width: 10),
+                      _TrendBadge(value: trend),
+                    ]),
+                  ]),
+                  Container(
+                    margin: const EdgeInsets.only(right: 8, top: 4),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: statusColor.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: statusColor.withOpacity(0.35)),
+                    ),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: <Widget>[
+                      Icon(
+                        status == 'IN RANGE'
+                            ? Icons.verified_rounded
+                            : status == 'LOW'
+                                ? Icons.arrow_downward_rounded
+                                : Icons.arrow_upward_rounded,
+                        size: 18,
+                        color: statusColor,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(status, style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: statusColor)),
+                    ]),
+                  ),
+                ],
+              ),
+
+              const SizedBox(height: 12),
+
+              // Chart
+              Expanded(
+                child: _GlucoseChart(
+                  points: _points,
+                  fromUtc: _fromUtc,
+                  minY: _minY,
+                  maxY: _maxY,
+                  low: _low,
+                  high: _high,
+                  dir: Directionality.of(context),
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              // Legend
+              Row(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+                Expanded(
+                  child: Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: const <Widget>[
+                      _LegendChip(color: Color(0xFF00BFA6), text: 'Glucose (mg/dL)'),
+                      _LegendChip(color: Color(0xFFFF9800), text: 'Low threshold'),
+                      _LegendChip(color: Color(0xFFE91E63), text: 'High threshold'),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                const Text('Last 24h', style: TextStyle(fontSize: 12, color: Color(0x99000000))),
+              ]),
+
+              errorWidget,
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LegendChip extends StatelessWidget {
+  const _LegendChip({required this.color, required this.text});
+  final Color color;
+  final String text;
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withOpacity(0.24)),
+      ),
+      child: Text(text, style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12, color: color)),
+    );
+  }
+}
+
+class _TrendBadge extends StatelessWidget {
+  const _TrendBadge({required this.value});
+  final double value;
+  @override
+  Widget build(BuildContext context) {
+    final bool up = value > 0.5;
+    final bool down = value < -0.5;
+    final Color color = up
+        ? const Color(0xFFE91E63)
+        : (down ? const Color(0xFFFF9800) : const Color(0xFF9E9E9E));
+    final IconData icon = up
+        ? Icons.north_east_rounded
+        : (down ? Icons.south_east_rounded : Icons.horizontal_rule_rounded);
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.10),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withOpacity(0.30)),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: <Widget>[
+        Icon(icon, size: 16, color: color),
+        const SizedBox(width: 6),
+        Text(value == 0 ? 'steady' : '${value > 0 ? '+' : ''}${value.toStringAsFixed(0)}',
+            style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12, color: color)),
+      ]),
+    );
+  }
+}
+
+class _GlucoseChart extends StatelessWidget {
+  const _GlucoseChart({
+    required this.points,
+    required this.fromUtc,
+    required this.minY,
+    required this.maxY,
+    required this.low,
+    required this.high,
+    required this.dir,
+  });
+
+  final List<_Point> points;
+  final DateTime fromUtc;
+  final double minY;
+  final double maxY;
+  final double low;
+  final double high;
+  final ui.TextDirection dir;
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: _TrendPainter(
+        points: points,
+        fromUtc: fromUtc,
+        minY: minY,
+        maxY: maxY,
+        low: low,
+        high: high,
+        dir: dir,
+      ),
+      child: const SizedBox.expand(),
+    );
+  }
+}
+
+class _TrendPainter extends CustomPainter {
+  _TrendPainter({
+    required this.points,
+    required this.fromUtc,
+    required this.minY,
+    required this.maxY,
+    required this.low,
+    required this.high,
+    required this.dir,
+  });
+
+  final List<_Point> points;
+  final DateTime fromUtc;
+  final double minY;
+  final double maxY;
+  final double low;
+  final double high;
+  final ui.TextDirection dir;
+
+  final double _left = 48;
+  final double _right = 16;
+  final double _top = 8;
+  final double _bottom = 44; // extra to avoid overlaps
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Rect plot = Rect.fromLTWH(_left, _top, size.width - _left - _right, size.height - _top - _bottom);
+
+    _drawGrid(canvas, plot);
+
+    _drawDashedH(canvas, plot, _yFor(low, plot), const Color(0xFFE68A00));
+    _drawDashedH(canvas, plot, _yFor(high, plot), const Color(0xFFE91E63));
+
+    if (points.isNotEmpty) {
+      final Path line = Path();
+      final Path fill = Path();
+
+      for (int i = 0; i < points.length; i++) {
+        final _Point p = points[i];
+        final double x = _xFor(p.ts, plot);
+        final double y = _yFor(p.y, plot);
+        if (i == 0) {
+          line.moveTo(x, y);
+          fill.moveTo(x, plot.bottom);
+          fill.lineTo(x, y);
+        } else {
+          line.lineTo(x, y);
+          fill.lineTo(x, y);
+        }
+      }
+      fill.lineTo(plot.right, plot.bottom);
+      fill.close();
+
+      final Paint areaPaint = Paint()
+        ..shader = const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: <Color>[Color(0x4000BFA6), Color(0x1400BFA6), Color(0x00000000)],
+          stops: <double>[0.0, 0.5, 1.0],
+        ).createShader(plot);
+      canvas.drawPath(fill, areaPaint);
+
+      final Paint linePaint = Paint()
+        ..color = const Color(0xFF00BFA6)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3.0
+        ..strokeCap = StrokeCap.round
+        ..isAntiAlias = true;
+      canvas.drawPath(line, linePaint);
+
+      final _Point last = points.last;
+      final Offset c = Offset(_xFor(last.ts, plot), _yFor(last.y, plot));
+      final Paint dot = Paint()
+        ..color = const Color(0xFF64FFDA)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3.0;
+      canvas.drawCircle(c, 4.0, dot);
+    }
+
+    _drawLeftAxis(canvas, plot);
+    _drawBottomAxis(canvas, plot);
+  }
+
+  void _drawGrid(Canvas canvas, Rect plot) {
+    final Paint h = Paint()
+      ..color = const Color(0x1A000000)
+      ..strokeWidth = 1;
+    final Paint v = Paint()
+      ..color = const Color(0x10000000)
+      ..strokeWidth = 1;
+
+    double start = (minY / 20).floor() * 20;
+    for (double y = start; y <= maxY; y += 20) {
+      final double yy = _yFor(y, plot);
+      canvas.drawLine(Offset(plot.left, yy), Offset(plot.right, yy), h);
+    }
+
+    for (int m = 0; m <= 24 * 60; m += 180) {
+      final double xx = _xFor(fromUtc.add(Duration(minutes: m)), plot);
+      canvas.drawLine(Offset(xx, plot.top), Offset(xx, plot.bottom), v);
+    }
+  }
+
+  void _drawLeftAxis(Canvas canvas, Rect plot) {
+    final TextStyle ts = const TextStyle(fontSize: 11, color: Color(0x99000000));
+    double start = (minY / 20).floor() * 20;
+    for (double y = start; y <= maxY; y += 20) {
+      final double yy = _yFor(y, plot);
+      final TextPainter tp = TextPainter(
+        text: TextSpan(text: y.toStringAsFixed(0), style: ts),
+        textAlign: TextAlign.right,
+        textDirection: dir,
+      )..layout(maxWidth: _left - 8);
+      tp.paint(canvas, Offset(8, yy - tp.height / 2));
+    }
+  }
+
+  void _drawBottomAxis(Canvas canvas, Rect plot) {
+    final TextStyle ts = const TextStyle(fontSize: 11, color: Color(0x99000000));
+    for (int m = 0; m <= 24 * 60; m += 180) {
+      final DateTime t = fromUtc.add(Duration(minutes: m));
+      final String hh = t.hour.toString().padLeft(2, '0');
+      final String mm = t.minute.toString().padLeft(2, '0');
+      final String label = hh + ':' + mm;
+      final double xx = _xFor(t, plot);
+      final TextPainter tp = TextPainter(
+        text: TextSpan(text: label, style: ts),
+        textAlign: TextAlign.center,
+        textDirection: dir,
+      )..layout(maxWidth: 60);
+      tp.paint(canvas, Offset(xx - tp.width / 2, plot.bottom + 8));
+    }
+  }
+
+  void _drawDashedH(Canvas canvas, Rect plot, double yy, Color color) {
+    const double dash = 6;
+    const double gap = 4;
+    double x = plot.left;
+    final Paint p = Paint()
+      ..color = color
+      ..strokeWidth = 1.5;
+    while (x < plot.right) {
+      final double nx = (x + dash).clamp(plot.left, plot.right);
+      canvas.drawLine(Offset(x, yy), Offset(nx, yy), p);
+      x = nx + gap;
+    }
+
+    final String text = (color.value == const Color(0xFFE68A00).value)
+        ? 'LOW ' + low.toStringAsFixed(0)
+        : 'HIGH ' + high.toStringAsFixed(0);
+    final TextPainter tp = TextPainter(
+      text: TextSpan(text: text, style: TextStyle(fontSize: 11, color: color)),
+      textAlign: TextAlign.left,
+      textDirection: dir,
+    )..layout(maxWidth: 100);
+    tp.paint(canvas, Offset(plot.left + 4, yy - tp.height - 2));
+  }
+
+  double _xFor(DateTime t, Rect plot) {
+    final int mins = t.difference(fromUtc).inMinutes;
+    final double frac = mins / (24 * 60);
+    return plot.left + frac * plot.width;
+  }
+
+  double _yFor(double v, Rect plot) {
+    final double frac = (v - minY) / (maxY - minY);
+    return plot.bottom - frac * plot.height;
+  }
+
+  @override
+  bool shouldRepaint(covariant _TrendPainter old) {
+    return old.points != points ||
+        old.minY != minY ||
+        old.maxY != maxY ||
+        old.low != low ||
+        old.high != high ||
+        old.fromUtc != fromUtc ||
+        old.dir != dir;
+  }
+}
+
+class _Point {
+  final DateTime ts;
+  final double y;
+  const _Point(this.ts, this.y);
+}
